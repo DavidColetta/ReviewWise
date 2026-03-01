@@ -116,7 +116,24 @@ def get_business_name(soup: BeautifulSoup) -> str:
     tag = soup.find("h1", class_=re.compile("title", re.I))
     if not tag:
         tag = soup.find("h1")
-    return tag.get_text(strip=True) if tag else "Unknown Business"
+    if not tag:
+        return "Unknown Business"
+
+    # Only take direct text nodes — ignores child spans like "Reviews 2,423"
+    from bs4 import NavigableString
+    direct_text = "".join(
+        str(node) for node in tag.children
+        if isinstance(node, NavigableString)
+    ).strip()
+
+    # Fall back to full text if direct text is empty
+    if not direct_text:
+        direct_text = tag.get_text(separator=" ", strip=True)
+
+    # Strip any trailing noise like "Reviews", digits, commas
+    direct_text = re.sub(r"(Reviews?[\s\d,]*)$", "", direct_text, flags=re.I).strip()
+
+    return direct_text or "Unknown Business"
 
 
 # ─────────────────────────────────────────────

@@ -169,26 +169,67 @@ def vectorize_reviews(df: pd.DataFrame):
 # Step 4: Cluster reviews
 # ─────────────────────────────────────────────
 
+def get_axis_label(component, feature_names, top_n=2):
+    loadings = list(zip(feature_names, component))
+    sorted_loadings = sorted(loadings, key=lambda x: x[1])
+    negative_end = " / ".join(name for name, _ in sorted_loadings[:top_n])
+    positive_end = " / ".join(name for name, _ in sorted_loadings[-top_n:])
+    return f"← {negative_end}   |   {positive_end} →"
+
+
 def cluster_reviews(df: pd.DataFrame, n_clusters: int = 5):
-    """Run PCA + KMeans on reviews. Returns df with cluster/pca columns added."""
+    """
+    Cluster using K-Means on a higher-dimensional PCA space (up to 10 components),
+    then project separately to 2D for visualization only.
+    """
     X, tfidf = vectorize_reviews(df)
 
-    # PCA for visualization
-    n_components = min(2, X.shape[0] - 1, X.shape[1] - 1)
-    pca = PCA(n_components=n_components, random_state=42)
-    X_pca = pca.fit_transform(X)
+    # Step 1: Reduce to up to 10 components for clustering (retains more info than 2)
+    n_cluster_components = min(10, X.shape[0] - 1, X.shape[1] - 1)
+    pca_cluster = PCA(n_components=n_cluster_components, random_state=42)
+    X_cluster = pca_cluster.fit_transform(X)
 
-    # KMeans
-    n_clusters = min(n_clusters, len(df))  # can't have more clusters than reviews
+    # Step 2: K-Means on the richer space
+    n_clusters = min(n_clusters, len(df))
     kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
-    labels = kmeans.fit_predict(X)
+    labels = kmeans.fit_predict(X_cluster)
+
+    # Step 3: Separate 2-component PCA just for visualization
+    pca_viz = PCA(n_components=2, random_state=42)
+    X_viz = pca_viz.fit_transform(X)
+
+    # Step 4: Build axis labels from interpretable features (themes + sentiment)
+    theme_names = list(THEME_KEYWORDS.keys())
+    try:
+        tfidf_names = list(tfidf.get_feature_names_out())
+    except Exception:
+        tfidf_names = []
+    interpretable_names = theme_names + ["sentiment"]
+    interpretable_start = len(tfidf_names)
+
+    comp1 = pca_viz.components_[0][interpretable_start:]
+    comp2 = pca_viz.components_[1][interpretable_start:]
+    axis_x_label = get_axis_label(comp1, interpretable_names)
+    axis_y_label = get_axis_label(comp2, interpretable_names)
+
+    variance_explained = pca_viz.explained_variance_ratio_
+
+    pca_meta = {
+        "axis_x_label":     axis_x_label,
+        "axis_y_label":     axis_y_label,
+        "variance_x":       float(variance_explained[0]),
+        "variance_y":       float(variance_explained[1]),
+        "variance_2d":      float(np.sum(variance_explained)),
+        "variance_cluster": float(np.sum(pca_cluster.explained_variance_ratio_)),
+        "n_cluster_components": n_cluster_components,
+    }
 
     df = df.copy()
     df["cluster"] = labels
-    df["pca_x"] = X_pca[:, 0]
-    df["pca_y"] = X_pca[:, 1] if X_pca.shape[1] > 1 else 0.0
+    df["pca_x"] = X_viz[:, 0]
+    df["pca_y"] = X_viz[:, 1]
 
-    return df, pca, kmeans, tfidf
+    return df, pca_viz, kmeans, tfidf, pca_meta
 
 
 # ─────────────────────────────────────────────
@@ -213,21 +254,36 @@ def get_top_words(cluster_df: pd.DataFrame, tfidf, n=8) -> list:
     except Exception:
         return []
 
-def name_cluster(cluster_df: pd.DataFrame) -> str:
-    """Auto-name a cluster by its dominant theme + sentiment."""
+def name_cluster(cluster_df: pd.DataFrame, top_words: list) -> tuple:
+    """Auto-name a cluster by its dominant theme + sentiment. Returns (name, sentiment_tag)."""
     theme_cols = list(THEME_KEYWORDS.keys())
-    theme_means = cluster_df[theme_cols].mean()
-    top_theme = theme_means.idxmax()
+    theme_means = cluster_df[theme_cols].mean().sort_values(ascending=False)
+    top_theme = theme_means.index[0]
 
     avg_sentiment = cluster_df["sentiment_score"].mean()
-    if avg_sentiment >= 0.2:
+    if avg_sentiment >= 0.15:
         sentiment_tag = "Praise"
     elif avg_sentiment <= -0.1:
         sentiment_tag = "Complaints"
     else:
-        sentiment_tag = "Mixed Feedback"
+        sentiment_tag = "Mixed"
 
-    return f"{top_theme} — {sentiment_tag}"
+    return f"{top_theme} — {sentiment_tag}", sentiment_tag
+
+
+def deduplicate_names(summaries: list) -> list:
+    """Append top keywords to any clusters that share the same name."""
+    from collections import Counter
+    name_counts = Counter(s["name"] for s in summaries)
+    duplicates = {name for name, count in name_counts.items() if count > 1}
+    seen = Counter()
+    for s in summaries:
+        if s["name"] in duplicates:
+            seen[s["name"]] += 1
+            keyword_suffix = ", ".join(s["top_words"][:2]) if s["top_words"] else str(seen[s["name"]])
+            s["name"] = f"{s['name']} ({keyword_suffix})"
+    return summaries
+
 
 def build_cluster_summaries(df: pd.DataFrame, tfidf) -> list:
     """Return a list of dicts, one per cluster, with summary stats."""
@@ -238,22 +294,24 @@ def build_cluster_summaries(df: pd.DataFrame, tfidf) -> list:
         avg_sentiment = cdf["sentiment_score"].mean()
         sentiment_counts = cdf["sentiment_label"].value_counts().to_dict()
         top_words = get_top_words(cdf, tfidf)
-        name = name_cluster(cdf)
+        name, sentiment_tag = name_cluster(cdf, top_words)
         avg_rating = cdf["rating"].mean() if "rating" in cdf.columns else None
         sample_reviews = cdf.nlargest(3, "sentiment_score")["review_text"].tolist() + \
                          cdf.nsmallest(2, "sentiment_score")["review_text"].tolist()
 
         summaries.append({
-            "cluster_id":      cluster_id,
-            "name":            name,
-            "review_count":    len(cdf),
-            "avg_sentiment":   round(avg_sentiment, 3),
-            "avg_rating":      round(avg_rating, 2) if avg_rating is not None else None,
+            "cluster_id":       cluster_id,
+            "name":             name,
+            "sentiment_tag":    sentiment_tag,
+            "review_count":     len(cdf),
+            "avg_sentiment":    round(avg_sentiment, 3),
+            "avg_rating":       round(avg_rating, 2) if avg_rating is not None else None,
             "sentiment_counts": sentiment_counts,
-            "top_words":       top_words,
-            "sample_reviews":  sample_reviews[:5],
+            "top_words":        top_words,
+            "sample_reviews":   sample_reviews[:5],
         })
 
+    summaries = deduplicate_names(summaries)
     return summaries
 
 
@@ -269,9 +327,9 @@ def run_pipeline(source, n_clusters: int = 5, progress_callback=None):
     """
     df = load_data(source)
     df = extract_signals(df, progress_callback=progress_callback)
-    df, pca, kmeans, tfidf = cluster_reviews(df, n_clusters=n_clusters)
+    df, pca_viz, kmeans, tfidf, pca_meta = cluster_reviews(df, n_clusters=n_clusters)
     summaries = build_cluster_summaries(df, tfidf)
-    return df, summaries
+    return df, summaries, pca_meta
 
 
 # ─────────────────────────────────────────────
@@ -284,7 +342,6 @@ def make_sample_data() -> pd.DataFrame:
     reviews = [
         # Food quality
         ("The pasta was absolutely incredible, fresh and full of flavor. Best I've had in years!", 5),
-        ("Food was cold when it arrived and completely bland. Really disappointing meal.", 2),
         ("Delicious dishes, the salmon was cooked perfectly. Generous portions too.", 5),
         ("The burger was dry and overcooked. The fries were soggy. Won't order again.", 1),
         ("Fresh ingredients, amazing taste. The chef clearly knows what they're doing.", 5),

@@ -92,7 +92,6 @@ with st.sidebar:
     st.caption("Understand what your customers are really saying.")
     st.markdown("---")
 
-    business_name = st.text_input("Business name", value="Luigi's Bistro")
     n_clusters = st.slider("Number of themes to find", min_value=2, max_value=8, value=5)
 
     st.markdown("---")
@@ -106,8 +105,12 @@ with st.sidebar:
     trustpilot_url = None
     uploaded_file = None
     max_pages = 5
+    business_name = "Luigi's Bistro"
 
-    if data_source == "Scrape Trustpilot":
+    if data_source == "Sample data":
+        business_name = st.text_input("Business name", value="Luigi's Bistro")
+
+    elif data_source == "Scrape Trustpilot":
         trustpilot_url = st.text_input(
             "Trustpilot URL or slug",
             placeholder="e.g. dominos.com",
@@ -118,6 +121,7 @@ with st.sidebar:
         st.caption("🕐 ~1 second per page")
 
     elif data_source == "Upload CSV":
+        business_name = st.text_input("Business name", placeholder="e.g. Mario's Pizzeria")
         uploaded_file = st.file_uploader("Upload CSV", type=["csv"])
         st.caption("Required column: `review_text`\nOptional: `rating`")
 
@@ -140,9 +144,9 @@ def get_results(df_json: str, n_clusters: int):
         pct = int(current / total * 100)
         progress_bar.progress(pct, text=f"Analyzing sentiment... {current}/{total} reviews")
 
-    result = run_pipeline(df, n_clusters=n_clusters, progress_callback=update_progress)
+    df_out, summaries, pca_meta = run_pipeline(df, n_clusters=n_clusters, progress_callback=update_progress)
     progress_bar.empty()
-    return result
+    return df_out, summaries, pca_meta
 
 @st.cache_data
 def scrape_data(url: str, max_pages: int):
@@ -191,7 +195,7 @@ st.markdown(f"# {business_name}")
 st.caption("Customer review analysis — powered by clustering & sentiment")
 
 with st.spinner("Analyzing reviews..."):
-    df, summaries = get_results(raw_df.to_json(), n_clusters)
+    df, summaries, pca_meta = get_results(raw_df.to_json(), n_clusters)
 
 # ─────────────────────────────────────────────
 # Top-level metrics
@@ -230,6 +234,15 @@ with tab1:
         sent_class, sent_text = sentiment_color(s["avg_sentiment"])
         rating_str = f" · {s['avg_rating']} ★" if s["avg_rating"] else ""
 
+        # Border color driven by sentiment_tag
+        tag = s.get("sentiment_tag", "Mixed")
+        if tag == "Praise":
+            border_color = "#27ae60"
+        elif tag == "Complaints":
+            border_color = "#c0392b"
+        else:
+            border_color = "#f39c12"
+
         # Build tag pills from top words
         tags_html = "".join(f'<span class="tag">{w}</span>' for w in s["top_words"])
 
@@ -240,7 +253,7 @@ with tab1:
         )
 
         card_html = f"""
-        <div class="cluster-card">
+        <div class="cluster-card" style="border-left-color: {border_color}">
             <div class="cluster-title">{s['name']}</div>
             <div class="cluster-meta">
                 {s['review_count']} reviews
@@ -260,40 +273,105 @@ with tab1:
 
 with tab2:
     st.subheader("Review Map")
-    st.caption("Each dot is a review. Reviews that cluster together share similar language and themes. Hover to read.")
+    st.caption("Each bubble is a theme cluster. Size = number of reviews. Hover to read sample reviews.")
 
     # Map cluster ids to names
     id_to_name = {s["cluster_id"]: s["name"] for s in summaries}
     df["theme"] = df["cluster"].map(id_to_name)
 
-    fig = px.scatter(
-        df,
-        x="pca_x",
-        y="pca_y",
-        color="theme",
-        hover_data={"review_text": True, "sentiment_score": ":.2f",
-                    "rating": True if has_ratings else False,
-                    "pca_x": False, "pca_y": False},
-        custom_data=["review_text", "sentiment_score"],
-        color_discrete_sequence=["#c0392b", "#e67e22", "#27ae60", "#2980b9", "#8e44ad", "#16a085", "#d35400"],
-        template="plotly_white",
-        labels={"pca_x": "", "pca_y": "", "theme": "Theme"},
-    )
+    # Build one row per cluster using centroid of PCA coords
+    cluster_plot_df = df.groupby("cluster").agg(
+        pca_x=("pca_x", "mean"),
+        pca_y=("pca_y", "mean"),
+    ).reset_index()
+    cluster_plot_df["theme"] = cluster_plot_df["cluster"].map(id_to_name)
 
-    fig.update_traces(
-        marker=dict(size=9, opacity=0.75, line=dict(width=0.5, color="white")),
-        hovertemplate="<b>%{customdata[0]}</b><br>Sentiment: %{customdata[1]:.2f}<extra></extra>"
-    )
+    # Merge in summary stats
+    summary_lookup = {s["cluster_id"]: s for s in summaries}
+    cluster_plot_df["review_count"]  = cluster_plot_df["cluster"].map(lambda c: summary_lookup[c]["review_count"])
+    cluster_plot_df["avg_sentiment"] = cluster_plot_df["cluster"].map(lambda c: summary_lookup[c]["avg_sentiment"])
+    cluster_plot_df["avg_rating"]    = cluster_plot_df["cluster"].map(lambda c: summary_lookup[c]["avg_rating"] or "N/A")
+    cluster_plot_df["top_words"]     = cluster_plot_df["cluster"].map(lambda c: ", ".join(summary_lookup[c]["top_words"][:5]))
+
+    # Build hover text — include sample reviews
+    def build_hover(row):
+        s = summary_lookup[row["cluster"]]
+        reviews_text = "<br>".join(
+            f'• {r[:80]}{"…" if len(r) > 80 else ""}'
+            for r in s["sample_reviews"][:4]
+        )
+        return (
+            f"<b>{row['theme']}</b><br>"
+            f"{row['review_count']} reviews · sentiment {row['avg_sentiment']:+.2f}<br>"
+            f"<i>Keywords: {row['top_words']}</i><br><br>"
+            f"{reviews_text}"
+        )
+
+    cluster_plot_df["hover_text"] = cluster_plot_df.apply(build_hover, axis=1)
+
+    colors = ["#c0392b", "#e67e22", "#27ae60", "#2980b9", "#8e44ad", "#16a085", "#d35400", "#2c3e50"]
+
+    fig = go.Figure()
+    for i, row in cluster_plot_df.iterrows():
+        fig.add_trace(go.Scatter(
+            x=[row["pca_x"]],
+            y=[row["pca_y"]],
+            mode="markers+text",
+            marker=dict(
+                size=row["review_count"] * 6,  # scale bubble by review count
+                sizemode="area",
+                sizeref=2.0 * max(cluster_plot_df["review_count"]) / (80 ** 2),
+                color=colors[i % len(colors)],
+                opacity=0.7,
+                line=dict(width=2, color="white"),
+            ),
+            text=row["theme"].split(" — ")[0],  # short label on bubble
+            textposition="middle center",
+            textfont=dict(size=13, color="black", family="Source Sans 3"),
+            hovertemplate=row["hover_text"] + "<extra></extra>",
+            name=row["theme"],
+        ))
+
     fig.update_layout(
-        height=520,
+        height=620,
         font_family="Source Sans 3",
-        legend_title_text="Theme",
-        xaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
-        yaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
+        showlegend=False,
+        xaxis=dict(
+            title=dict(text=pca_meta["axis_x_label"], font=dict(size=11, color="#888")),
+            showgrid=False, zeroline=False, showticklabels=False,
+        ),
+        yaxis=dict(
+            title=dict(text=pca_meta["axis_y_label"], font=dict(size=11, color="#888")),
+            showgrid=False, zeroline=False, showticklabels=False,
+        ),
         plot_bgcolor="#faf8f5",
         paper_bgcolor="#faf8f5",
+        hoverlabel=dict(
+            bgcolor="white",
+            font_size=13,
+            font_family="Source Sans 3",
+            bordercolor="#ddd",
+        ),
+        margin=dict(t=20, b=60, l=20, r=20),
     )
     st.plotly_chart(fig, use_container_width=True)
+
+    col_v1, col_v2, col_v3 = st.columns(3)
+    col_v1.metric(
+        "Variance explained (2D view)",
+        f"{pca_meta['variance_2d']:.0%}",
+        help="How much of the data variation is visible in this chart"
+    )
+    col_v2.metric(
+        f"Variance for clustering ({pca_meta['n_cluster_components']} components)",
+        f"{pca_meta['variance_cluster']:.0%}",
+        help="How much information was retained when clustering. Higher = better clusters."
+    )
+    col_v3.metric(
+        "X / Y axis split",
+        f"{pca_meta['variance_x']:.0%} / {pca_meta['variance_y']:.0%}",
+        help="How much variance each axis captures individually"
+    )
 
 
 # ════════════════════════════════════════════
