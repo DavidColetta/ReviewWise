@@ -97,16 +97,34 @@ with st.sidebar:
 
     st.markdown("---")
     st.markdown("**Data source**")
-    use_sample = st.checkbox("Use sample data", value=True)
+    data_source = st.radio(
+        "Choose source",
+        ["Sample data", "Scrape Trustpilot", "Upload CSV"],
+        label_visibility="collapsed"
+    )
+
+    trustpilot_url = None
     uploaded_file = None
-    if not use_sample:
-        uploaded_file = st.file_uploader(
-            "Upload CSV",
-            type=["csv"],
-            help="Required column: review_text\nOptional: rating"
+    max_pages = 5
+
+    if data_source == "Scrape Trustpilot":
+        trustpilot_url = st.text_input(
+            "Trustpilot URL or slug",
+            placeholder="e.g. dominos.com",
+            help="Paste a full URL like https://www.trustpilot.com/review/dominos.com or just the slug"
         )
+        max_pages = st.slider("Max pages to scrape", 1, 20, 5,
+                              help="Each page has ~20 reviews. More pages = slower but richer analysis.")
+        st.caption("🕐 ~1 second per page")
+
+    elif data_source == "Upload CSV":
+        uploaded_file = st.file_uploader("Upload CSV", type=["csv"])
         st.caption("Required column: `review_text`\nOptional: `rating`")
 
+
+# ─────────────────────────────────────────────
+# Load & run pipeline
+# ─────────────────────────────────────────────
 
 # ─────────────────────────────────────────────
 # Load & run pipeline
@@ -115,7 +133,21 @@ with st.sidebar:
 @st.cache_data
 def get_results(df_json: str, n_clusters: int):
     df = pd.read_json(df_json)
-    return run_pipeline(df, n_clusters=n_clusters)
+
+    progress_bar = st.progress(0, text="Loading sentiment model...")
+
+    def update_progress(current, total):
+        pct = int(current / total * 100)
+        progress_bar.progress(pct, text=f"Analyzing sentiment... {current}/{total} reviews")
+
+    result = run_pipeline(df, n_clusters=n_clusters, progress_callback=update_progress)
+    progress_bar.empty()
+    return result
+
+@st.cache_data
+def scrape_data(url: str, max_pages: int):
+    from scraper import scrape_trustpilot
+    return scrape_trustpilot(url, max_pages=max_pages)
 
 def sentiment_color(score):
     if score >= 0.05:
@@ -124,12 +156,32 @@ def sentiment_color(score):
         return "sentiment-neg", "● Negative"
     return "sentiment-neu", "● Neutral"
 
-# Decide data source
+# ── Decide data source ──
 raw_df = None
-if use_sample:
+
+if data_source == "Sample data":
     raw_df = make_sample_data()
-elif uploaded_file is not None:
-    raw_df = pd.read_csv(uploaded_file)
+
+elif data_source == "Scrape Trustpilot":
+    if trustpilot_url:
+        with st.spinner(f"Scraping Trustpilot ({max_pages} pages max)..."):
+            try:
+                raw_df, scraped_name = scrape_data(trustpilot_url, max_pages)
+                business_name = scraped_name  # override sidebar name with real name
+                st.success(f"Scraped **{len(raw_df)} reviews** for **{scraped_name}**")
+            except ValueError as e:
+                st.error(f"Scraping failed: {e}")
+                st.stop()
+    else:
+        st.info("👈 Enter a Trustpilot URL or slug in the sidebar to get started.")
+        st.stop()
+
+elif data_source == "Upload CSV":
+    if uploaded_file:
+        raw_df = pd.read_csv(uploaded_file)
+    else:
+        st.info("👈 Upload a CSV file in the sidebar to get started.")
+        st.stop()
 
 # ─────────────────────────────────────────────
 # Main content
@@ -137,10 +189,6 @@ elif uploaded_file is not None:
 
 st.markdown(f"# {business_name}")
 st.caption("Customer review analysis — powered by clustering & sentiment")
-
-if raw_df is None:
-    st.info("👈 Check **Use sample data** in the sidebar, or upload your own CSV to get started.")
-    st.stop()
 
 with st.spinner("Analyzing reviews..."):
     df, summaries = get_results(raw_df.to_json(), n_clusters)
@@ -276,47 +324,59 @@ with tab3:
         )
         st.plotly_chart(fig_donut, use_container_width=True)
 
-    # Sentiment per theme bar
+    # Star rating distribution (if available)
     with col_b:
-        st.subheader("Sentiment by Theme")
-        theme_sent = df.groupby("theme")["sentiment_score"].mean().sort_values()
-        bar_colors = ["#c0392b" if v < 0 else "#27ae60" for v in theme_sent.values]
-        fig_bar = go.Figure(go.Bar(
-            x=theme_sent.values,
-            y=theme_sent.index,
-            orientation="h",
-            marker_color=bar_colors,
-            text=[f"{v:+.2f}" for v in theme_sent.values],
-            textposition="outside",
-        ))
-        fig_bar.update_layout(
-            height=320,
-            xaxis_title="Avg Sentiment Score",
-            yaxis_title="",
-            font_family="Source Sans 3",
-            paper_bgcolor="#faf8f5",
-            plot_bgcolor="#faf8f5",
-            margin=dict(l=10, r=40, t=10, b=10),
-            xaxis=dict(range=[-1.1, 1.1], zeroline=True, zerolinecolor="#ddd"),
-        )
-        st.plotly_chart(fig_bar, use_container_width=True)
+        if has_ratings:
+            st.subheader("Rating Distribution")
+            rating_counts = df["rating"].value_counts().sort_index()
+            fig_ratings = go.Figure(go.Bar(
+                x=rating_counts.index,
+                y=rating_counts.values,
+                marker_color=["#c0392b", "#e67e22", "#f1c40f", "#2ecc71", "#27ae60"],
+                text=rating_counts.values,
+                textposition="outside",
+            ))
+            fig_ratings.update_layout(
+                height=320,
+                xaxis_title="Stars",
+                yaxis_title="Reviews",
+                font_family="Source Sans 3",
+                paper_bgcolor="#faf8f5",
+                plot_bgcolor="#faf8f5",
+                margin=dict(t=10),
+                xaxis=dict(tickmode="linear"),
+            )
+            st.plotly_chart(fig_ratings, use_container_width=True)
+        else:
+            st.subheader("Sentiment Score Distribution")
+            fig_hist = px.histogram(
+                df, x="sentiment_score", nbins=20,
+                color_discrete_sequence=["#2980b9"],
+                template="plotly_white",
+                labels={"sentiment_score": "Sentiment Score"},
+            )
+            fig_hist.update_layout(
+                height=320,
+                font_family="Source Sans 3",
+                paper_bgcolor="#faf8f5",
+                plot_bgcolor="#faf8f5",
+                margin=dict(t=10),
+            )
+            st.plotly_chart(fig_hist, use_container_width=True)
 
-    # Cluster summary table
+    # Theme summary table
     st.subheader("Theme Summary")
-
     table_rows = []
     for s in sorted(summaries, key=lambda x: x["review_count"], reverse=True):
         sent_emoji = "🟢" if s["avg_sentiment"] >= 0.05 else ("🔴" if s["avg_sentiment"] <= -0.05 else "🟡")
         table_rows.append({
-            "Theme":           s["name"],
-            "Reviews":         s["review_count"],
-            "Avg Rating":      f"{s['avg_rating']} ★" if s["avg_rating"] else "—",
-            "Sentiment":       f"{sent_emoji} {s['avg_sentiment']:+.2f}",
-            "Top Keywords":    ", ".join(s["top_words"][:4]),
+            "Theme":        s["name"],
+            "Reviews":      s["review_count"],
+            "Avg Rating":   f"{s['avg_rating']} ★" if s["avg_rating"] else "—",
+            "Sentiment":    f"{sent_emoji} {s['avg_sentiment']:+.2f}",
+            "Top Keywords": ", ".join(s["top_words"][:4]),
         })
-
-    summary_df = pd.DataFrame(table_rows)
-    st.dataframe(summary_df, use_container_width=True, hide_index=True)
+    st.dataframe(pd.DataFrame(table_rows), use_container_width=True, hide_index=True)
 
 # ─────────────────────────────────────────────
 # Footer

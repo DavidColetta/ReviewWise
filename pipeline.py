@@ -1,6 +1,6 @@
 import pandas as pd
 import numpy as np
-from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
+from transformers import pipeline as hf_pipeline
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.decomposition import PCA
 from sklearn.cluster import KMeans
@@ -21,7 +21,23 @@ THEME_KEYWORDS = {
     "Drinks":         ["drink", "cocktail", "wine", "beer", "coffee", "beverage", "bar", "alcohol", "juice", "tea"],
 }
 
-sentiment_analyzer = SentimentIntensityAnalyzer()
+# ─────────────────────────────────────────────
+# Load DistilBERT sentiment model (cached)
+# ─────────────────────────────────────────────
+
+_sentiment_pipeline = None
+
+def get_sentiment_pipeline():
+    """Load once and reuse — first call downloads ~250MB model."""
+    global _sentiment_pipeline
+    if _sentiment_pipeline is None:
+        _sentiment_pipeline = hf_pipeline(
+            "sentiment-analysis",
+            model="distilbert-base-uncased-finetuned-sst-2-english",
+            truncation=True,
+            max_length=512,
+        )
+    return _sentiment_pipeline
 
 
 # ─────────────────────────────────────────────
@@ -54,9 +70,6 @@ def load_data(source) -> pd.DataFrame:
 # Step 2: Extract per-review signals
 # ─────────────────────────────────────────────
 
-def get_sentiment(text: str) -> float:
-    return sentiment_analyzer.polarity_scores(str(text))["compound"]
-
 def get_sentiment_label(score: float) -> str:
     if score >= 0.05:
         return "Positive"
@@ -74,9 +87,40 @@ def get_theme_scores(text: str) -> dict:
         for theme, kws in THEME_KEYWORDS.items()
     }
 
-def extract_signals(df: pd.DataFrame) -> pd.DataFrame:
+def run_distilbert_sentiment(texts: list, progress_callback=None) -> list:
+    """
+    Run DistilBERT sentiment on a list of texts in batches.
+    Returns a list of scores in range [-1, +1].
+    POSITIVE label → positive score, NEGATIVE → negative score.
+    """
+    nlp = get_sentiment_pipeline()
+    scores = []
+    batch_size = 32
+
+    for i in range(0, len(texts), batch_size):
+        batch = texts[i : i + batch_size]
+        results = nlp(batch)
+        for r in results:
+            raw = r["score"]  # confidence 0.5–1.0
+            if raw < 0.75:
+                # Not confident enough — call it neutral
+                scores.append(0.0)
+            else:
+                score = (raw - 0.5) * 2  # rescale to 0..1
+                if r["label"] == "NEGATIVE":
+                    score = -score
+                scores.append(round(score, 4))
+
+        if progress_callback:
+            progress_callback(min(i + batch_size, len(texts)), len(texts))
+
+    return scores
+
+def extract_signals(df: pd.DataFrame, progress_callback=None) -> pd.DataFrame:
     df = df.copy()
-    df["sentiment_score"] = df["review_text"].apply(get_sentiment)
+
+    texts = df["review_text"].tolist()
+    df["sentiment_score"] = run_distilbert_sentiment(texts, progress_callback)
     df["sentiment_label"] = df["sentiment_score"].apply(get_sentiment_label)
 
     theme_scores = df["review_text"].apply(get_theme_scores).apply(pd.Series)
@@ -217,13 +261,14 @@ def build_cluster_summaries(df: pd.DataFrame, tfidf) -> list:
 # Full pipeline
 # ─────────────────────────────────────────────
 
-def run_pipeline(source, n_clusters: int = 5):
+def run_pipeline(source, n_clusters: int = 5, progress_callback=None):
     """
     End-to-end pipeline. Returns (df_with_signals, cluster_summaries).
     source: filepath string or pd.DataFrame
+    progress_callback: optional fn(current, total) for progress bars
     """
     df = load_data(source)
-    df = extract_signals(df)
+    df = extract_signals(df, progress_callback=progress_callback)
     df, pca, kmeans, tfidf = cluster_reviews(df, n_clusters=n_clusters)
     summaries = build_cluster_summaries(df, tfidf)
     return df, summaries
