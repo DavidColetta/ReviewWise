@@ -1,3 +1,4 @@
+# [UPDATED FILE] single_business.py
 """
 Single Business view — data loading, quality report, pipeline, and all four tabs.
 """
@@ -146,9 +147,10 @@ def render(data_source: str, business_name: str, trustpilot_url: str,
     st.markdown("---")
 
     # ── Tabs ──
-    tab1, tab2, tab3, tab4 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5 = st.tabs([
         "📦 Theme Clusters", "🗺️ Review Map",
-        "📈 Sentiment Breakdown", "🔬 Pipeline Analysis"
+        "📈 Sentiment Breakdown", "🔬 Pipeline Analysis",
+        "👤 Reviewer Profiles"  # New tab
     ])
 
     with tab1:
@@ -163,12 +165,22 @@ def render(data_source: str, business_name: str, trustpilot_url: str,
     with tab4:
         _tab_pipeline(elbow_result, pca_meta)
 
+    with tab5:
+        # Import here to avoid circular imports
+        try:
+            from views.profile_analyzer import render_profile_analysis
+            render_profile_analysis(df)
+        except ImportError as e:
+            st.error(f"Could not load profile analyzer: {e}")
+            st.info("Make sure profile_analyzer.py is in the correct location.")
+
 
 # ─────────────────────────────────────────────
-# Sub-sections
+# Sub-sections (Helper Functions)
 # ─────────────────────────────────────────────
 
 def _render_quality_report(raw_df: pd.DataFrame):
+    """Render data quality report in an expander."""
     quality = compute_data_quality(raw_df)
     with st.expander("📋 Data Quality Report", expanded=False):
         qcol1, qcol2, qcol3, qcol4 = st.columns(4)
@@ -208,6 +220,7 @@ def _render_metrics(
     label_col: str = "sentiment_label",
     use_blended: bool = False,
 ):
+    """Render top metrics and download button."""
     has_ratings = "rating" in df.columns and df["rating"].notna().any()
     effective_label = df[label_col] if label_col in df.columns else df["sentiment_label"]
     pct_positive = (effective_label == "Positive").mean() * 100
@@ -233,6 +246,7 @@ def _render_metrics(
 
 
 def _tab_clusters(summaries: list, use_blended: bool = False):
+    """Tab 1: Theme clusters display."""
     st.subheader("What customers are talking about")
     st.caption(f"Reviews grouped into {len(summaries)} themes by topic and sentiment.")
     for s in sorted(summaries, key=lambda x: x["review_count"], reverse=True):
@@ -246,6 +260,7 @@ def _tab_clusters(summaries: list, use_blended: bool = False):
 
 
 def _tab_review_map(df: pd.DataFrame, summaries: list, pca_meta: dict):
+    """Tab 2: Review map visualization."""
     st.subheader("Review Map")
     st.caption("Each bubble is a theme cluster. Size = number of reviews. Hover to read sample reviews.")
 
@@ -257,10 +272,10 @@ def _tab_review_map(df: pd.DataFrame, summaries: list, pca_meta: dict):
         pca_x=("pca_x", "mean"),
         pca_y=("pca_y", "mean"),
     ).reset_index()
-    cluster_plot_df["theme"]        = cluster_plot_df["cluster"].map(id_to_name)
+    cluster_plot_df["theme"] = cluster_plot_df["cluster"].map(id_to_name)
     cluster_plot_df["review_count"] = cluster_plot_df["cluster"].map(lambda c: summary_lookup[c]["review_count"])
-    cluster_plot_df["avg_sentiment"]= cluster_plot_df["cluster"].map(lambda c: summary_lookup[c]["avg_sentiment"])
-    cluster_plot_df["top_words"]    = cluster_plot_df["cluster"].map(lambda c: ", ".join(summary_lookup[c]["top_words"][:5]))
+    cluster_plot_df["avg_sentiment"] = cluster_plot_df["cluster"].map(lambda c: summary_lookup[c]["avg_sentiment"])
+    cluster_plot_df["top_words"] = cluster_plot_df["cluster"].map(lambda c: ", ".join(summary_lookup[c]["top_words"][:5]))
 
     hover_texts = []
     for _, row in cluster_plot_df.iterrows():
@@ -295,6 +310,7 @@ def _tab_sentiment(
     label_col: str = "sentiment_label",
     use_blended: bool = False,
 ):
+    """Tab 3: Sentiment analysis and distributions."""
     has_ratings = "rating" in df.columns and df["rating"].notna().any()
     col_a, col_b = st.columns(2)
 
@@ -330,16 +346,17 @@ def _tab_sentiment(
         active_sent = s.get("avg_sentiment_blended", s["avg_sentiment"]) if use_blended else s["avg_sentiment"]
         emoji = "🟢" if active_sent >= 0.05 else ("🔴" if active_sent <= -0.05 else "🟡")
         table_rows.append({
-            "Theme":              s["name"],
-            "Reviews":            s["review_count"],
-            "Avg Rating":         f"{s['avg_rating']} ★" if s["avg_rating"] else "—",
-            sentiment_col_label:  f"{emoji} {active_sent:+.2f}",
-            "Top Keywords":       ", ".join(s["top_words"][:4]),
+            "Theme": s["name"],
+            "Reviews": s["review_count"],
+            "Avg Rating": f"{s['avg_rating']} ★" if s["avg_rating"] else "—",
+            sentiment_col_label: f"{emoji} {active_sent:+.2f}",
+            "Top Keywords": ", ".join(s["top_words"][:4]),
         })
     st.dataframe(pd.DataFrame(table_rows), use_container_width=True, hide_index=True)
 
 
 def _tab_pipeline(elbow_result: dict, pca_meta: dict):
+    """Tab 4: Pipeline analysis with elbow curves and PCA info."""
     st.subheader("Optimal Number of Clusters")
     st.caption("Computed by running K-Means for K=2 to K=8 and measuring cluster quality.")
 
