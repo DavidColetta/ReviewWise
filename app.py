@@ -7,7 +7,7 @@ from views import single_business, compare
 # ─────────────────────────────────────────────
 
 st.set_page_config(
-    page_title="Review Aggregator",
+    page_title="ReviewWise",
     page_icon="🔍",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -20,7 +20,7 @@ inject_css()
 # ─────────────────────────────────────────────
 
 with st.sidebar:
-    st.markdown("## 🔍 Review Aggregator")
+    st.markdown("## 🔍 ReviewWise")
     st.caption("Understand what your customers are really saying.")
     st.markdown("---")
 
@@ -151,4 +151,4 @@ else:
 # ─────────────────────────────────────────────
 
 st.markdown("---")
-st.caption("Review Aggregator · Built with Streamlit, scikit-learn & DistilBERT")
+st.caption("ReviewWise · Built with Streamlit, scikit-learn & DistilBERT")
